@@ -6,12 +6,12 @@
 
 use proc_macro::TokenStream;
 use proc_macro_error2::abort_call_site;
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, quote_spanned};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::token::AndAnd;
 use syn::{
-    BinOp, Block, Expr, ExprBinary, Ident, Stmt, Token, parse_macro_input, parse_quote,
+    BinOp, Block, Expr, ExprBinary, ExprWhile, Ident, Stmt, Token, parse_macro_input, parse_quote,
     visit_mut::VisitMut,
 };
 
@@ -137,20 +137,18 @@ impl VisitMut for CallReplacer {
         // Visit nested expressions first
         syn::visit_mut::visit_expr_mut(self, expr);
 
-        if let Expr::Call(call) = expr {
-            if let Expr::Path(expr_path) = &*call.func {
-                if self.should_replace(expr_path) {
-                    let replace_var =
-                        self.replacements.iter().find(|(e, _)| e == expr).map(|(_, v)| v);
-                    if let Some(var) = replace_var {
-                        *expr = syn::parse_quote!(#var);
-                    } else {
-                        let new_var = self.generate_var_name();
-                        self.replacements.push((expr.clone(), new_var.clone()));
-                        *expr = syn::parse_quote!(#new_var);
-                    };
-                }
-            }
+        if let Expr::Call(call) = expr
+            && let Expr::Path(expr_path) = &*call.func
+            && self.should_replace(expr_path)
+        {
+            let replace_var = self.replacements.iter().find(|(e, _)| e == expr).map(|(_, v)| v);
+            if let Some(var) = replace_var {
+                *expr = syn::parse_quote!(#var);
+            } else {
+                let new_var = self.generate_var_name();
+                self.replacements.push((expr.clone(), new_var.clone()));
+                *expr = syn::parse_quote!(#new_var);
+            };
         }
     }
 }
@@ -226,17 +224,40 @@ fn transform_break_continue(block: &mut Block) {
         return (true, None);
     };
     // Add semicolon to the last statement if it's an expression without semicolon
-    if let Some(Stmt::Expr(_, ref mut semi)) = block.stmts.last_mut() {
-        if semi.is_none() {
-            *semi = Some(Default::default());
-        }
+    if let Some(&mut Stmt::Expr(_, ref mut semi)) = block.stmts.last_mut()
+        && semi.is_none()
+    {
+        *semi = Some(Default::default());
     }
     block.stmts.push(return_stmt);
+}
+
+fn while_let_rewrite(loopexpr: Stmt) -> Stmt {
+    if let Stmt::Expr(ref expr, _) = loopexpr
+        && let Expr::While(ExprWhile { cond, body, .. }) = expr
+        && let Expr::Let(ref let_expr) = **cond
+    {
+        let pat = &let_expr.pat;
+        let scrutinee = &let_expr.expr;
+
+        // Transform to loop with match
+        return parse_quote! {
+            loop {
+                match #scrutinee {
+                    #pat => #body,
+                    _ => break,
+                }
+            };
+        };
+    }
+
+    loopexpr.clone()
 }
 
 pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
     // parse the stmt of the loop
     let mut loop_stmt: Stmt = syn::parse(item.clone()).unwrap();
+    loop_stmt = while_let_rewrite(loop_stmt);
 
     // name of the loop invariant as closure of the form
     // __kani_loop_invariant_#startline_#startcol_#endline_#endcol
@@ -246,6 +267,7 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // expr of the loop invariant
     let mut inv_expr: Expr = syn::parse(attr).unwrap();
+    let original_span = inv_expr.span();
 
     // adding on_entry variables
     let mut onentry_var_prefix: String = "__kani_onentry_var".to_owned();
@@ -300,11 +322,11 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
     register_name.push_str(&loop_id);
     let register_ident = format_ident!("{}", register_name);
 
-    match loop_stmt {
-        Stmt::Expr(ref mut e, _) => match e {
+    match &mut loop_stmt {
+        &mut Stmt::Expr(ref mut e, _) => match *e {
             Expr::While(ref mut ew) => {
                 let new_cond: Expr = syn::parse(
-                    quote!(
+                    quote_spanned!(original_span =>
                         #register_ident(&||->bool{#inv_expr}, 0))
                     .into(),
                 )
@@ -318,7 +340,9 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             Expr::Loop(ref mut el) => {
                 //let retexpr = get_return_statement(&el.body);
-                let invstmt: Stmt = syn::parse(quote!(if !(#register_ident(&||->bool{#inv_expr}, 0)) {assert!(false); unreachable!()};).into()).unwrap();
+                let invstmt: Stmt = syn::parse(quote_spanned!(original_span =>
+                    if !(#register_ident(&||->bool{#inv_expr}, 0)) {assert!(false); unreachable!()};)
+                    .into()).unwrap();
                 let mut new_stmts: Vec<Stmt> = Vec::new();
                 new_stmts.push(invstmt);
                 new_stmts.extend(el.body.stmts.clone());
@@ -336,7 +360,7 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     if has_prev {
-        quote!(
+        quote_spanned!(original_span =>
         {
         if (#loop_guard) {
         #(#onentry_decl_stms)*
@@ -365,7 +389,7 @@ pub fn loop_invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .into()
     } else {
-        quote!(
+        quote_spanned!(original_span =>
         {
         #(#onentry_decl_stms)*
         // Dummy function used to force the compiler to capture the environment.

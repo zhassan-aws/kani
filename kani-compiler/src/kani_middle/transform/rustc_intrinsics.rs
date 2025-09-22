@@ -14,20 +14,20 @@ use crate::kani_middle::transform::body::{
 use crate::kani_middle::transform::{TransformPass, TransformationType};
 use crate::kani_queries::QueryDb;
 use rustc_middle::ty::TyCtxt;
-use rustc_smir::rustc_internal;
-use stable_mir::mir::mono::Instance;
-use stable_mir::mir::{
+use rustc_public::mir::mono::Instance;
+use rustc_public::mir::{
     BasicBlockIdx, BinOp, Body, ConstOperand, LocalDecl, Operand, Rvalue, StatementKind,
     Terminator, TerminatorKind,
 };
-use stable_mir::ty::{
+use rustc_public::rustc_internal;
+use rustc_public::ty::{
     FnDef, GenericArgKind, GenericArgs, IntTy, MirConst, RigidTy, Span, Ty, TyKind, UintTy,
 };
 use std::collections::HashMap;
 use tracing::debug;
 
 /// Generate the body for a few Kani intrinsics.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RustcIntrinsicsPass {
     /// Used to cache FnDef lookups for intrinsics models.
     models: HashMap<KaniModel, FnDef>,
@@ -62,7 +62,7 @@ impl TransformPass for RustcIntrinsicsPass {
     }
 }
 
-fn is_panic_function(tcx: &TyCtxt, def_id: rustc_smir::stable_mir::DefId) -> bool {
+fn is_panic_function(tcx: &TyCtxt, def_id: rustc_public::DefId) -> bool {
     let def_id = rustc_internal::internal(*tcx, def_id);
     Some(def_id) == tcx.lang_items().panic_fn()
         || tcx.has_attr(def_id, rustc_span::sym::rustc_const_panic_str)
@@ -180,8 +180,8 @@ impl MutMirVisitor for ReplaceIntrinsicCallVisitor<'_, '_> {
                 let intrinsic = Intrinsic::from_instance(&instance);
                 debug!(?intrinsic, "handle_terminator");
                 match intrinsic {
+                    Intrinsic::AlignOfVal => self.models[&KaniModel::AlignOfVal],
                     Intrinsic::SizeOfVal => self.models[&KaniModel::SizeOfVal],
-                    Intrinsic::MinAlignOfVal => self.models[&KaniModel::AlignOfVal],
                     Intrinsic::PtrOffsetFrom => self.models[&KaniModel::PtrOffsetFrom],
                     Intrinsic::PtrOffsetFromUnsigned => {
                         self.models[&KaniModel::PtrOffsetFromUnsigned]

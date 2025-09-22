@@ -35,14 +35,32 @@ use rustc_middle::ty::layout::{
     LayoutOfHelpers, TyAndLayout,
 };
 use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_public::mir::Body;
+use rustc_public::mir::mono::Instance;
+use rustc_public::ty::Allocation;
 use rustc_span::Span;
 use rustc_span::source_map::respan;
 use rustc_target::callconv::FnAbi;
-use stable_mir::mir::Body;
-use stable_mir::mir::mono::Instance;
-use stable_mir::ty::Allocation;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
+
+/// A minimal context needed for recording our results. This allows us to move ownership of the
+/// other fields of a [GotocCtx] for use elsewhere by calling the `split()` method on it.
+///
+/// For example, we do not use the `symbol_table` field of a [GotocCtx] when recording results, so ownership
+/// can be directly moved to the thread handling file exporting, avoiding a clone!
+pub struct MinimalGotocCtx {
+    /// A map of unsupported constructs that were found while codegen
+    pub unsupported_constructs: UnsupportedConstructs,
+    /// A map of concurrency constructs that are treated sequentially.
+    /// We collect them and print one warning at the end if not empty instead of printing one
+    /// warning at each occurrence.
+    pub concurrent_constructs: UnsupportedConstructs,
+    /// The body transformation agent.
+    pub transformer: BodyTransformation,
+    /// If there exist some usage of loop contracts int context.
+    pub has_loop_contracts: bool,
+}
 
 pub struct GotocCtx<'tcx> {
     /// the typing context
@@ -112,6 +130,20 @@ impl<'tcx> GotocCtx<'tcx> {
             has_loop_contracts: false,
             current_loop_modifies: Vec::new(),
         }
+    }
+
+    /// Split a full, owned [GotocCtx<'tcx>] into the [MinimalGotocCtx] needed for recording results,
+    /// and any other fields that need to be used separately.
+    pub fn split(self) -> (MinimalGotocCtx, SymbolTable) {
+        (
+            MinimalGotocCtx {
+                unsupported_constructs: self.unsupported_constructs,
+                concurrent_constructs: self.concurrent_constructs,
+                transformer: self.transformer,
+                has_loop_contracts: self.has_loop_contracts,
+            },
+            self.symbol_table,
+        )
     }
 }
 
@@ -318,10 +350,12 @@ impl GotocCtx<'_> {
     pub fn handle_quantifiers(&mut self) {
         // Store the found quantifiers and the inlined results.
         let mut to_modify: BTreeMap<InternedString, SymbolValues> = BTreeMap::new();
+        let mut suffix_count: u16 = 0;
         for (key, symbol) in self.symbol_table.iter() {
-            if let SymbolValues::Stmt(stmt) = &symbol.value {
-                let new_stmt_val = SymbolValues::Stmt(self.handle_quantifiers_in_stmt(stmt));
-                to_modify.insert(*key, new_stmt_val);
+            if let SymbolValues::Stmt(stmt) = &symbol.value
+                && let Some(new_stmt) = self.handle_quantifiers_in_stmt(stmt, &mut suffix_count)
+            {
+                to_modify.insert(*key, SymbolValues::Stmt(new_stmt));
             }
         }
 
@@ -332,7 +366,8 @@ impl GotocCtx<'_> {
     }
 
     /// Find all quantifier expressions in `stmt` and recursively inline functions.
-    fn handle_quantifiers_in_stmt(&self, stmt: &Stmt) -> Stmt {
+    /// Returns a new [Stmt] if something has been changed (e.g. by inlining), or [None] if it should remain the same.
+    fn handle_quantifiers_in_stmt(&self, stmt: &Stmt, suffix_count: &mut u16) -> Option<Stmt> {
         match &stmt.body() {
             // According to the hook handling for quantifiers, quantifier expressions must be of form
             // lhs = typecast(qex, c_bool)
@@ -345,13 +380,13 @@ impl GotocCtx<'_> {
                             let mut visited_func_symbols: HashSet<InternedString> = HashSet::new();
                             // We count the number of function that we have inlined, and use the count to
                             // make inlined labeled unique.
-                            let mut suffix_count: u16 = 0;
+                            //let mut suffix_count: u16 = 0;
 
                             let end_stmt = Stmt::code_expression(
                                 self.inline_function_calls_in_expr(
                                     domain,
                                     &mut visited_func_symbols,
-                                    &mut suffix_count,
+                                    suffix_count,
                                 )
                                 .unwrap(),
                                 *domain.location(),
@@ -398,21 +433,44 @@ impl GotocCtx<'_> {
                             );
                             res.cast_to(Type::CInteger(CIntType::Bool))
                         }
-                        _ => rhs.clone(),
+                        _ => return None,
                     },
-                    _ => rhs.clone(),
+                    _ => return None,
                 };
-                Stmt::assign(lhs.clone(), new_rhs, *stmt.location())
+                Some(Stmt::assign(lhs.clone(), new_rhs, *stmt.location()))
             }
             // Recursively find quantifier expressions.
-            StmtBody::Block(stmts) => Stmt::block(
-                stmts.iter().map(|stmt| self.handle_quantifiers_in_stmt(stmt)).collect(),
-                *stmt.location(),
-            ),
-            StmtBody::Label { label, body } => {
-                self.handle_quantifiers_in_stmt(body).with_label(*label)
+            StmtBody::Block(old_stmts) => {
+                let mut replaced_sub_stmts: FxHashMap<usize, Stmt> = FxHashMap::default();
+
+                // For each block, add it and its index to the map if it should be replaced.
+                for (i, stmt) in old_stmts.iter().enumerate() {
+                    if let Some(new_stmt) = self.handle_quantifiers_in_stmt(stmt, suffix_count) {
+                        replaced_sub_stmts.insert(i, new_stmt);
+                    }
+                }
+
+                if replaced_sub_stmts.is_empty() {
+                    // We can skip doing anything if none of the blocks have to be replaced.
+                    None
+                } else {
+                    // Take the replacement block if replaced, otherwise just clone the old value.
+                    Some(Stmt::block(
+                        old_stmts
+                            .iter()
+                            .enumerate()
+                            .map(|(i, old_stmt)| {
+                                replaced_sub_stmts.remove(&i).unwrap_or_else(|| old_stmt.clone())
+                            })
+                            .collect(),
+                        *stmt.location(),
+                    ))
+                }
             }
-            _ => stmt.clone(),
+            StmtBody::Label { label, body } => {
+                Some(self.handle_quantifiers_in_stmt(body, suffix_count)?.with_label(*label))
+            }
+            _ => None,
         }
     }
 
@@ -451,7 +509,7 @@ impl GotocCtx<'_> {
     ) -> Stmt {
         match stmt.body() {
             StmtBody::Return(Some(expr)) => {
-                if let ExprValue::Symbol { ref identifier } = expr.value() {
+                if let ExprValue::Symbol { identifier } = expr.value() {
                     *return_symbol = Some(Expr::symbol_expression(*identifier, expr.typ().clone()));
                     Stmt::goto(*end_label, *stmt.location())
                 } else {

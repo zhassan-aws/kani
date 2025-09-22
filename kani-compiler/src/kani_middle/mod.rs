@@ -6,16 +6,17 @@
 use std::collections::HashSet;
 
 use crate::kani_queries::QueryDb;
+use fxhash::FxHashMap;
 use rustc_hir::{def::DefKind, def_id::DefId as InternalDefId, def_id::LOCAL_CRATE};
 use rustc_middle::ty::TyCtxt;
-use rustc_smir::rustc_internal;
-use stable_mir::mir::TerminatorKind;
-use stable_mir::mir::mono::{Instance, MonoItem};
-use stable_mir::ty::{
+use rustc_public::mir::TerminatorKind;
+use rustc_public::mir::mono::{Instance, MonoItem};
+use rustc_public::rustc_internal;
+use rustc_public::ty::{
     AdtDef, AdtKind, FnDef, GenericArgKind, GenericArgs, RigidTy, Span as SpanStable, Ty, TyKind,
 };
-use stable_mir::visitor::{Visitable, Visitor as TyVisitor};
-use stable_mir::{CrateDef, DefId};
+use rustc_public::visitor::{Visitable, Visitor as TyVisitor};
+use rustc_public::{CrateDef, DefId};
 use std::ops::ControlFlow;
 
 use self::attributes::KaniAttributes;
@@ -97,10 +98,10 @@ impl TyVisitor for FindUnsafeCell<'_> {
 pub fn check_reachable_items(tcx: TyCtxt, queries: &QueryDb, items: &[MonoItem]) {
     // Avoid printing the same error multiple times for different instantiations of the same item.
     let mut def_ids = HashSet::new();
-    let reachable_functions: HashSet<InternalDefId> = items
+    let reachable_functions: HashSet<DefId> = items
         .iter()
         .filter_map(|i| match i {
-            MonoItem::Fn(instance) => Some(rustc_internal::internal(tcx, instance.def.def_id())),
+            MonoItem::Fn(instance) => Some(instance.def.def_id()),
             _ => None,
         })
         .collect();
@@ -116,8 +117,8 @@ pub fn check_reachable_items(tcx: TyCtxt, queries: &QueryDb, items: &[MonoItem])
             let attributes = KaniAttributes::for_def_id(tcx, def_id);
             // Check if any unstable attribute was reached.
             attributes.check_unstable_features(&queries.args().unstable_features);
-            // Check whether all `proof_for_contract` functions are reachable
-            attributes.check_proof_for_contract(&reachable_functions);
+            // Check whether all `proof_for_contract` targets are reachable
+            attributes.check_proof_for_contract_reachability(&reachable_functions);
             def_ids.insert(def_id);
         }
     }
@@ -178,7 +179,27 @@ pub fn stable_fn_def(tcx: TyCtxt, def_id: InternalDefId) -> Option<FnDef> {
 /// ```
 /// So we select the terminator that calls T::kani::Arbitrary::any(), then try to resolve it to an Instance.
 /// `T` implements Arbitrary iff we successfully resolve the Instance.
-fn implements_arbitrary(ty: Ty, kani_any_def: FnDef) -> bool {
+fn implements_arbitrary(
+    ty: Ty,
+    kani_any_def: FnDef,
+    ty_arbitrary_cache: &mut FxHashMap<Ty, bool>,
+) -> bool {
+    if let Some(v) = ty_arbitrary_cache.get(&ty) {
+        return *v;
+    }
+
+    if ty.kind().rigid().is_none() {
+        return false;
+    }
+
+    if let TyKind::RigidTy(RigidTy::Ref(_, inner_ty, _)) = ty.kind() {
+        if let TyKind::RigidTy(RigidTy::Adt(..)) = inner_ty.kind() {
+            return can_derive_arbitrary(inner_ty, kani_any_def, ty_arbitrary_cache);
+        } else {
+            return implements_arbitrary(inner_ty, kani_any_def, ty_arbitrary_cache);
+        }
+    }
+
     let kani_any_body =
         Instance::resolve(kani_any_def, &GenericArgs(vec![GenericArgKind::Type(ty)]))
             .unwrap()
@@ -192,20 +213,33 @@ fn implements_arbitrary(ty: Ty, kani_any_def: FnDef) -> bool {
         if let TyKind::RigidTy(RigidTy::FnDef(def, args)) =
             func.ty(kani_any_body.arg_locals()).unwrap().kind()
         {
-            return Instance::resolve(def, &args).is_ok();
+            let res = Instance::resolve(def, &args).is_ok();
+            ty_arbitrary_cache.insert(ty, res);
+            return res;
         }
     }
     false
 }
 
-/// Is `ty` a struct or enum whose fields/variants implement Arbitrary?
-fn can_derive_arbitrary(ty: Ty, kani_any_def: FnDef) -> bool {
-    let variants_can_derive = |def: AdtDef| {
+/// Is `ty` a struct or enum whose fields/variants implement Arbitrary, or a reference to such a
+/// type?
+fn can_derive_arbitrary(
+    ty: Ty,
+    kani_any_def: FnDef,
+    ty_arbitrary_cache: &mut FxHashMap<Ty, bool>,
+) -> bool {
+    let mut variants_can_derive = |def: AdtDef, args: GenericArgs| {
         for variant in def.variants_iter() {
             let fields = variant.fields();
             let mut fields_impl_arbitrary = true;
-            for ty in fields.iter().map(|field| field.ty()) {
-                fields_impl_arbitrary &= implements_arbitrary(ty, kani_any_def);
+            for ty in fields.iter().map(|field| field.ty_with_args(&args)) {
+                if let TyKind::RigidTy(RigidTy::Adt(..)) = ty.kind() {
+                    fields_impl_arbitrary &=
+                        can_derive_arbitrary(ty, kani_any_def, ty_arbitrary_cache);
+                } else {
+                    fields_impl_arbitrary &=
+                        implements_arbitrary(ty, kani_any_def, ty_arbitrary_cache);
+                }
             }
             if !fields_impl_arbitrary {
                 return false;
@@ -214,18 +248,26 @@ fn can_derive_arbitrary(ty: Ty, kani_any_def: FnDef) -> bool {
         true
     };
 
-    if let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() {
+    if let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() {
+        for arg in &args.0 {
+            if let GenericArgKind::Lifetime(..) = arg {
+                return false;
+            }
+        }
+
         match def.kind() {
             AdtKind::Enum => {
                 // Enums with no variants cannot be instantiated
                 if def.num_variants() == 0 {
                     return false;
                 }
-                variants_can_derive(def)
+                variants_can_derive(def, args)
             }
-            AdtKind::Struct => variants_can_derive(def),
+            AdtKind::Struct => variants_can_derive(def, args),
             AdtKind::Union => false,
         }
+    } else if let TyKind::RigidTy(RigidTy::Ref(_, inner_ty, _)) = ty.kind() {
+        can_derive_arbitrary(inner_ty, kani_any_def, ty_arbitrary_cache)
     } else {
         false
     }

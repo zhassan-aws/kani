@@ -8,12 +8,12 @@ use crate::kani_middle::transform::body::{MutMirVisitor, MutableBody};
 use crate::kani_middle::transform::{TransformPass, TransformationType};
 use crate::kani_queries::QueryDb;
 use rustc_middle::ty::TyCtxt;
-use rustc_smir::rustc_internal;
-use stable_mir::CrateDef;
-use stable_mir::mir::mono::Instance;
-use stable_mir::mir::visit::{Location, MirVisitor};
-use stable_mir::mir::{Body, ConstOperand, LocalDecl, Operand, Terminator, TerminatorKind};
-use stable_mir::ty::{FnDef, MirConst, RigidTy, TyKind};
+use rustc_public::CrateDef;
+use rustc_public::mir::mono::Instance;
+use rustc_public::mir::visit::{Location, MirVisitor};
+use rustc_public::mir::{Body, ConstOperand, LocalDecl, Operand, Terminator, TerminatorKind};
+use rustc_public::rustc_internal;
+use rustc_public::ty::{FnDef, MirConst, RigidTy, TyKind};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use tracing::{debug, trace};
@@ -22,7 +22,7 @@ use tracing::{debug, trace};
 ///
 /// This pass will replace the entire body, and it should only be applied to stubs
 /// that have a body.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FnStubPass {
     stubs: Stubs,
 }
@@ -74,7 +74,7 @@ impl FnStubPass {
 ///
 /// This pass will replace the function call, since one of the functions do not have a body to
 /// replace.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExternFnStubPass {
     pub stubs: Stubs,
 }
@@ -97,7 +97,7 @@ impl TransformPass for ExternFnStubPass {
     /// Search for calls to extern functions that should be stubbed.
     ///
     /// We need to find function calls and function pointers.
-    /// We should replace this with a visitor once StableMIR includes a mutable one.
+    /// We should replace this with a visitor once rustc_public includes a mutable one.
     fn transform(&mut self, _tcx: TyCtxt, body: Body, instance: Instance) -> (bool, Body) {
         trace!(function=?instance.name(), "transform");
         let mut new_body = MutableBody::from(body);

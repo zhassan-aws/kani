@@ -10,7 +10,7 @@
 //! applied multiple times, one per specialization.
 //!
 //! Another downside is that these modifications cannot be applied to concrete playback, since they
-//! are applied on the top of StableMIR body, which cannot be propagated back to rustc's backend.
+//! are applied on the top of rustc_public body, which cannot be propagated back to rustc's backend.
 //!
 //! # Warn
 //!
@@ -21,6 +21,7 @@ use crate::kani_middle::reachability::CallGraph;
 use crate::kani_middle::transform::body::CheckType;
 use crate::kani_middle::transform::check_uninit::{DelayedUbPass, UninitPass};
 use crate::kani_middle::transform::check_values::ValidValuePass;
+use crate::kani_middle::transform::clone::{ClonableGlobalPass, ClonableTransformPass};
 use crate::kani_middle::transform::contracts::{AnyModifiesPass, FunctionWithContractPass};
 use crate::kani_middle::transform::kani_intrinsics::IntrinsicGeneratorPass;
 use crate::kani_middle::transform::loop_contracts::LoopContractPass;
@@ -29,8 +30,8 @@ use crate::kani_queries::QueryDb;
 use automatic::{AutomaticArbitraryPass, AutomaticHarnessPass};
 use dump_mir_pass::DumpMirPass;
 use rustc_middle::ty::TyCtxt;
-use stable_mir::mir::Body;
-use stable_mir::mir::mono::{Instance, MonoItem};
+use rustc_public::mir::Body;
+use rustc_public::mir::mono::{Instance, MonoItem};
 use std::collections::HashMap;
 use std::fmt::Debug;
 
@@ -58,9 +59,9 @@ mod stubs;
 pub struct BodyTransformation {
     /// The passes that may change the function body according to harness configuration.
     /// The stubbing passes should be applied before so user stubs take precedence.
-    stub_passes: Vec<Box<dyn TransformPass>>,
+    stub_passes: Vec<Box<dyn ClonableTransformPass>>,
     /// The passes that may add safety checks to the function body.
-    inst_passes: Vec<Box<dyn TransformPass>>,
+    inst_passes: Vec<Box<dyn ClonableTransformPass>>,
     /// Cache transformation results.
     cache: HashMap<Instance, TransformationResult>,
 }
@@ -75,7 +76,7 @@ impl BodyTransformation {
         let safety_check_type = CheckType::new_safety_check_assert_assume(queries);
         let unsupported_check_type = CheckType::new_unsupported_check_assert_assume_false(queries);
         // This has to come first, since creating harnesses affects later stubbing and contract passes.
-        transformer.add_pass(queries, AutomaticHarnessPass::new(unit, queries));
+        transformer.add_pass(queries, AutomaticHarnessPass::new(queries));
         transformer.add_pass(queries, AutomaticArbitraryPass::new(unit, queries));
         transformer.add_pass(queries, FnStubPass::new(&unit.stubs));
         transformer.add_pass(queries, ExternFnStubPass::new(&unit.stubs));
@@ -86,7 +87,7 @@ impl BodyTransformation {
         transformer.add_pass(
             queries,
             ValidValuePass {
-                safety_check_type: safety_check_type.clone(),
+                safety_check_type,
                 unsupported_check_type: unsupported_check_type.clone(),
             },
         );
@@ -139,7 +140,18 @@ impl BodyTransformation {
         }
     }
 
-    fn add_pass<P: TransformPass + 'static>(&mut self, query_db: &QueryDb, pass: P) {
+    /// Clone an empty [BodyTransformation] for use within the same [CodegenUnit] and [TyCtxt] that were
+    /// used to create it. Will panic if the transformer has already been queried with `.body()`.
+    pub fn clone_empty(&self) -> Self {
+        debug_assert!(self.cache.is_empty());
+        BodyTransformation {
+            stub_passes: self.stub_passes.to_vec(),
+            inst_passes: self.inst_passes.to_vec(),
+            cache: HashMap::new(),
+        }
+    }
+
+    fn add_pass<P: ClonableTransformPass + 'static>(&mut self, query_db: &QueryDb, pass: P) {
         if pass.is_enabled(query_db) {
             match P::transformation_type() {
                 TransformationType::Instrumentation => self.inst_passes.push(Box::new(pass)),
@@ -179,7 +191,8 @@ pub(crate) trait GlobalPass: Debug {
     where
         Self: Sized;
 
-    /// Run a transformation pass on the whole codegen unit.
+    /// Run a transformation pass on the whole codegen unit, returning a bool
+    /// for whether modifications were made to the MIR that could affect reachability.
     fn transform(
         &mut self,
         tcx: TyCtxt,
@@ -187,7 +200,7 @@ pub(crate) trait GlobalPass: Debug {
         starting_items: &[MonoItem],
         instances: Vec<Instance>,
         transformer: &mut BodyTransformation,
-    );
+    ) -> bool;
 }
 
 /// The transformation result.
@@ -198,10 +211,11 @@ enum TransformationResult {
     NotModified,
 }
 
+#[derive(Clone)]
 pub struct GlobalPasses {
     /// The passes that operate on the whole codegen unit, they run after all previous passes are
     /// done.
-    global_passes: Vec<Box<dyn GlobalPass>>,
+    global_passes: Vec<Box<dyn ClonableGlobalPass>>,
 }
 
 impl GlobalPasses {
@@ -219,13 +233,14 @@ impl GlobalPasses {
         global_passes
     }
 
-    fn add_global_pass<P: GlobalPass + 'static>(&mut self, query_db: &QueryDb, pass: P) {
+    fn add_global_pass<P: ClonableGlobalPass + 'static>(&mut self, query_db: &QueryDb, pass: P) {
         if pass.is_enabled(query_db) {
             self.global_passes.push(Box::new(pass))
         }
     }
 
     /// Run all global passes and store the results in a cache that can later be queried by `body`.
+    /// Returns a boolean for if a pass has modified the MIR bodies.
     pub fn run_global_passes(
         &mut self,
         transformer: &mut BodyTransformation,
@@ -233,9 +248,71 @@ impl GlobalPasses {
         starting_items: &[MonoItem],
         instances: Vec<Instance>,
         call_graph: CallGraph,
-    ) {
-        for global_pass in self.global_passes.iter_mut() {
-            global_pass.transform(tcx, &call_graph, starting_items, instances.clone(), transformer);
+    ) -> bool {
+        let mut modified = false;
+        for global_pass in &mut self.global_passes {
+            modified |= global_pass.transform(
+                tcx,
+                &call_graph,
+                starting_items,
+                instances.clone(),
+                transformer,
+            );
         }
+        modified
     }
+}
+
+mod clone {
+    //! This is all just machinery to implement `Clone` for a `Box<dyn TransformPass + Clone>`.
+    //!
+    //! To avoid circular reasoning, we use two traits that can each clone into a dyn of the other, and since
+    //! we set both up to have blanket implementations for all `T: TransformPass + Clone`, the compiler pieces them together properly
+    //! and we can implement `Clone` directly using the pair!
+
+    /// Builds a new dyn compatible wrapper trait that's essentially equivalent to extending
+    /// `$extends` with `Clone`. Requires an ident for an intermediate trait for avoiding cycles
+    /// in the implementation.
+    macro_rules! implement_clone {
+        ($new_trait_name: ident, $intermediate_trait_name: ident, $extends: path) => {
+            #[allow(private_interfaces)]
+            pub(crate) trait $new_trait_name: $extends {
+                fn clone_there(&self) -> Box<dyn $intermediate_trait_name>;
+            }
+
+            impl Clone for Box<dyn $new_trait_name> {
+                fn clone(&self) -> Self {
+                    self.clone_there().clone_back()
+                }
+            }
+
+            #[allow(private_interfaces)]
+            impl<T: $extends + Clone + 'static> $new_trait_name for T {
+                fn clone_there(&self) -> Box<dyn $intermediate_trait_name> {
+                    Box::new(self.clone())
+                }
+            }
+
+            trait $intermediate_trait_name {
+                fn clone_back(&self) -> Box<dyn $new_trait_name>;
+            }
+
+            impl<T: $extends + Clone + 'static> $intermediate_trait_name for T {
+                fn clone_back(&self) -> Box<dyn $new_trait_name> {
+                    Box::new(self.clone())
+                }
+            }
+        };
+    }
+
+    implement_clone!(
+        ClonableTransformPass,
+        ClonableTransformPassMid,
+        crate::kani_middle::transform::TransformPass
+    );
+    implement_clone!(
+        ClonableGlobalPass,
+        ClonableGlobalPassMid,
+        crate::kani_middle::transform::GlobalPass
+    );
 }

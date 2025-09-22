@@ -28,8 +28,8 @@ use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_driver::{Callbacks, Compilation, run_compiler};
 use rustc_interface::Config;
 use rustc_middle::ty::TyCtxt;
+use rustc_public::rustc_internal;
 use rustc_session::config::ErrorOutputType;
-use rustc_smir::rustc_internal;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 

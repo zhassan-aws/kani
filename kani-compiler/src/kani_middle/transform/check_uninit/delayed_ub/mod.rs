@@ -21,17 +21,17 @@ use initial_target_visitor::{AnalysisTarget, InitialTargetVisitor};
 use instrumentation_visitor::InstrumentationVisitor;
 use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::JoinSemiLattice;
-use rustc_session::config::OutputType;
-use stable_mir::{
+use rustc_public::{
     mir::MirVisitor,
     mir::mono::{Instance, MonoItem},
     ty::FnDef,
 };
+use rustc_session::config::OutputType;
 
 mod initial_target_visitor;
 mod instrumentation_visitor;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DelayedUbPass {
     pub safety_check_type: CheckType,
     pub unsupported_check_type: CheckType,
@@ -65,7 +65,8 @@ impl GlobalPass for DelayedUbPass {
         starting_items: &[MonoItem],
         instances: Vec<Instance>,
         transformer: &mut BodyTransformation,
-    ) {
+    ) -> bool {
+        let mut modified = false;
         // Collect all analysis targets (pointers to places reading and writing from which should be
         // tracked).
         let targets: HashSet<_> = instances
@@ -138,11 +139,13 @@ impl GlobalPass for DelayedUbPass {
                 );
                 // If some instrumentation has been performed, update the cached body in the local transformer.
                 if instrumentation_added {
+                    modified = true;
                     transformer.cache.entry(instance).and_modify(|transformation_result| {
                         *transformation_result = TransformationResult::Modified(body);
                     });
                 }
             }
         }
+        modified
     }
 }
